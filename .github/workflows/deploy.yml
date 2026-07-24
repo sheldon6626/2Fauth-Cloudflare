@@ -35,15 +35,44 @@ jobs:
         run: |
           if [ -z "$CLOUDFLARE_API_TOKEN" ]; then
             echo "❌ Error: CLOUDFLARE_API_TOKEN secret is missing!"
-            echo "Please add CLOUDFLARE_API_TOKEN in GitHub Settings -> Secrets and variables -> Actions."
             exit 1
           fi
           if [ -z "$CLOUDFLARE_ACCOUNT_ID" ]; then
             echo "❌ Error: CLOUDFLARE_ACCOUNT_ID secret is missing!"
-            echo "Please add CLOUDFLARE_ACCOUNT_ID in GitHub Settings -> Secrets and variables -> Actions."
             exit 1
           fi
           echo "✅ Cloudflare API credentials detected."
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+      - name: Ensure D1 Database Exists & Update wrangler.toml
+        run: |
+          # Try to get database ID from Cloudflare Account, create if missing
+          DB_LIST=$(npx wrangler d1 list --json 2>/dev/null || echo "[]")
+          DB_ID=$(echo "$DB_LIST" | node -e '
+            const input = require("fs").readFileSync(0, "utf-8");
+            try {
+              const list = JSON.parse(input);
+              const found = list.find(d => d.name === "worker-2fauth-db");
+              if (found) console.log(found.uuid || found.database_id || "");
+            } catch {}
+          ')
+          
+          if [ -z "$DB_ID" ]; then
+            echo "Creating D1 database worker-2fauth-db on Cloudflare Account..."
+            CREATE_OUT=$(npx wrangler d1 create worker-2fauth-db 2>&1 || true)
+            echo "$CREATE_OUT"
+            DB_ID=$(echo "$CREATE_OUT" | grep -oE '[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}' | head -n 1)
+          fi
+
+          if [ -n "$DB_ID" ]; then
+            echo "✅ D1 Database Ready: $DB_ID"
+            sed -i "s/database_id = ".*"/database_id = "$DB_ID"/" wrangler.toml
+          else
+            echo "❌ Could not create or locate D1 database_id"
+            exit 1
+          fi
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
