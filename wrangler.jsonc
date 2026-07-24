@@ -1,12 +1,12 @@
 {
-  "name": "worker-2fauth",
+  "name": "2fauth-cloudflare",
   "main": "src/worker.js",
   "compatibility_date": "2025-01-01",
   "d1_databases": [
     {
       "binding": "DB",
       "database_name": "worker-2fauth-db",
-      "database_id": "b388dc9b-021e-4184-a256-5599139acfa6"
+      "database_id": "41fd0ede-4fa3-459a-9e73-3fa966cbe1eb"
     }
   ],
   "vars": {
