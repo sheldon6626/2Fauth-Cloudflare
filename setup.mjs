@@ -120,7 +120,7 @@ async function main() {
   warn('请妥善保存 BOOTSTRAP_TOKEN！首次打开 Worker 页面初始化管理员账号时需要输入。');
 
   header('步骤 6/8: 配置 wrangler.toml');
-  const wranglerContent = `name = "worker-2fauth"
+  const wranglerContent = `name = "2fauth-cloudflare"
 main = "src/worker.js"
 compatibility_date = "2025-01-01"
 

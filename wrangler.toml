@@ -1,4 +1,4 @@
-﻿name = "worker-2fauth"
+﻿name = "2fauth-cloudflare"
 main = "src/worker.js"
 compatibility_date = "2025-01-01"
 

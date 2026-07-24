@@ -97,7 +97,7 @@ Write-Warn "⚠️ 请妥善保存 BOOTSTRAP_TOKEN！首次打开 Worker 页面�
 
 Write-Header "步骤 6/8: 配置 wrangler.toml"
 $tomlContent = @"
-name = "worker-2fauth"
+name = "2fauth-cloudflare"
 main = "src/worker.js"
 compatibility_date = "2025-01-01"
 
