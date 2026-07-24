@@ -1,7 +1,6 @@
-name = "worker-2fauth"
+﻿name = "worker-2fauth"
 main = "src/worker.js"
 compatibility_date = "2025-01-01"
-# F-13: database_id is safe to commit (not a secret) but consider using only database_name in dev branches
 
 [[d1_databases]]
 binding = "DB"

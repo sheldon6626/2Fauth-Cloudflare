@@ -17,3 +17,11 @@ SECURITY-AUDIT*.md
 coverage/
 .nyc_output/
 *.log
+
+# Secrets and environment files
+.env
+.secrets*
+
+# Cache and local tooling
+.npm-cache/
+.workflow-journal/
