@@ -13,7 +13,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: '20'
           cache: 'npm'
       - run: npm ci
       - run: npm test
@@ -27,15 +27,38 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: '20'
           cache: 'npm'
       - run: npm ci
 
+      - name: Verify Cloudflare Credentials
+        run: |
+          if [ -z "$CLOUDFLARE_API_TOKEN" ]; then
+            echo "❌ Error: CLOUDFLARE_API_TOKEN secret is missing!"
+            echo "Please add CLOUDFLARE_API_TOKEN in GitHub Settings -> Secrets and variables -> Actions."
+            exit 1
+          fi
+          if [ -z "$CLOUDFLARE_ACCOUNT_ID" ]; then
+            echo "❌ Error: CLOUDFLARE_ACCOUNT_ID secret is missing!"
+            echo "Please add CLOUDFLARE_ACCOUNT_ID in GitHub Settings -> Secrets and variables -> Actions."
+            exit 1
+          fi
+          echo "✅ Cloudflare API credentials detected."
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
       - name: Set Wrangler Secrets
         run: |
-          echo "$ENCRYPTION_KEY" | npx wrangler secret put ENCRYPTION_KEY
-          echo "$SESSION_PEPPER" | npx wrangler secret put SESSION_PEPPER
-          echo "$BOOTSTRAP_TOKEN" | npx wrangler secret put BOOTSTRAP_TOKEN
+          if [ -n "$ENCRYPTION_KEY" ]; then
+            echo "$ENCRYPTION_KEY" | npx wrangler secret put ENCRYPTION_KEY
+          fi
+          if [ -n "$SESSION_PEPPER" ]; then
+            echo "$SESSION_PEPPER" | npx wrangler secret put SESSION_PEPPER
+          fi
+          if [ -n "$BOOTSTRAP_TOKEN" ]; then
+            echo "$BOOTSTRAP_TOKEN" | npx wrangler secret put BOOTSTRAP_TOKEN
+          fi
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
