@@ -134,6 +134,7 @@ ALLOW_PLAINTEXT_EXPORT = "false"
 `;
 
   writeFileSync('wrangler.toml', wranglerContent, 'utf8');
+  if (existsSync('wrangler.jsonc')) fsModule.unlinkSync('wrangler.jsonc');
   success(`wrangler.toml 已更新 (database_id: ${dbId})`);
 
   header('步骤 7/8: 写入 Cloudflare Secrets');
