@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { pbkdf2Sync } from "node:crypto";
+import { pbkdf2Sync, webcrypto } from "node:crypto";
 import test from "node:test";
 
 import worker from "../src/worker.js";
@@ -42,6 +42,7 @@ function apiSessionDb(state = {}) {
               session_id: 7,
               client_type: "android",
               last_used_at: state.lastUsedAt,
+              created_at: state.createdAt,
               id: 3,
               username: "alice",
               role: "user",
@@ -65,6 +66,10 @@ function apiSessionDb(state = {}) {
 
 function webAppDataDb(state = {}) {
   return {
+    async batch(statements) {
+      state.batchSize = statements.length;
+      return Promise.all(statements.map((statement) => statement.run()));
+    },
     prepare(sql) {
       const statement = {
         bind(...args) {
@@ -161,6 +166,14 @@ function loginRiskDb(state = {}) {
 
 function passwordHash(password, saltB64, iterations = 100_000) {
   return pbkdf2Sync(password, Buffer.from(saltB64, "base64"), iterations, 32, "sha256").toString("base64");
+}
+
+async function encryptWorkerSecret(plain) {
+  const key = await webcrypto.subtle.importKey("raw", new Uint8Array(32), "AES-GCM", false, ["encrypt"]);
+  const iv = new Uint8Array(12);
+  iv[0] = 1;
+  const ciphertext = await webcrypto.subtle.encrypt({ name: "AES-GCM", iv }, key, new TextEncoder().encode(plain));
+  return `${Buffer.from(iv).toString("base64")}:${Buffer.from(ciphertext).toString("base64")}`;
 }
 
 function legacyWebLoginDb(state = {}, userOverrides = {}) {
@@ -297,6 +310,7 @@ function authenticatedSessionDb(user, handler = {}) {
             return {
               session_id: 10,
               step_up_at: state.stepUpAt || null,
+              created_at: state.sessionCreatedAt,
               id: 1,
               username: "admin",
               role: "admin",
@@ -508,10 +522,15 @@ test("web UI responses include HTML security headers", async () => {
 
   assert.equal(response.status, 200);
   assert.match(response.headers.get("Content-Security-Policy"), /frame-ancestors 'none'/);
+  assert.match(response.headers.get("Content-Security-Policy"), /object-src 'none'/);
+  assert.match(response.headers.get("Content-Security-Policy"), /media-src 'self' blob:/);
   assert.doesNotMatch(response.headers.get("Content-Security-Policy"), /unsafe-inline/);
   assert.match(response.headers.get("Content-Security-Policy"), /'nonce-[0-9a-f]{32}'/);
   assert.equal(response.headers.get("X-Frame-Options"), "DENY");
   assert.equal(response.headers.get("X-Content-Type-Options"), "nosniff");
+  assert.equal(response.headers.get("Cross-Origin-Opener-Policy"), "same-origin");
+  assert.equal(response.headers.get("Origin-Agent-Cluster"), "?1");
+  assert.match(response.headers.get("Permissions-Policy"), /camera=\(self\)/);
   const html = await response.text();
   assert.match(html, /<title>2FAuth 验证器<\/title>/);
   assert.match(html, /<h1>2FAuth 验证器<\/h1>/);
@@ -549,6 +568,11 @@ test("web UI keeps phone and tablet navigation responsive", async () => {
   assert.match(html, /sidebar\.setAttribute\("inert", ""\)/);
   assert.match(html, /\.entries-grid, \.transfer-grid, \.settings-grid \{ grid-template-columns: 1fr; \}/);
   assert.match(html, /min-height: 44px; display: inline-flex/);
+  assert.match(html, /\.main \{ width: min\(100%, 1920px\)/);
+  assert.match(html, /\.dialog\.wide \{ width: min\(calc\(100% - 40px\), 860px\)/);
+  assert.match(html, /touch-action: none/);
+  assert.match(html, /addEventListener\("pointermove"/);
+  assert.match(html, /addEventListener\("dragstart"/);
 });
 
 test("web UI includes Chinese and English copy without native business dialogs", async () => {
@@ -575,12 +599,15 @@ test("web UI applies the generated nonce to inline style and script", async () =
 test("web UI client keeps authentication and form submission recovery paths", () => {
   assert.doesNotThrow(() => new Function("TURNSTILE_SITE_KEY", "PLAINTEXT_EXPORT_ENABLED", CLIENT_SCRIPT));
   assert.match(CLIENT_SCRIPT, /window\.turnstile\.reset\(turnstileWidgetId\)/);
+  assert.match(CLIENT_SCRIPT, /action: "login"/);
   assert.match(CLIENT_SCRIPT, /turnstileToken = "";\s+throw error;/);
   assert.match(CLIENT_SCRIPT, /bootstrapForm: "bootstrap"/);
   assert.match(CLIENT_SCRIPT, /loginForm: "login"/);
   assert.match(CLIENT_SCRIPT, /entryForm: "save-entry"/);
   assert.match(CLIENT_SCRIPT, /groupForm: "create-group"/);
   assert.match(CLIENT_SCRIPT, /riskForm: "save-login-policy"/);
+  assert.match(CLIENT_SCRIPT, /clearImportSensitiveFields\(\)/);
+  assert.match(CLIENT_SCRIPT, /byId\("actionFields"\)\.replaceChildren\(\)/);
 });
 
 test("web UI marks the OTP search as a non-credential field", async () => {
@@ -711,6 +738,31 @@ test("TURNSTILE_KEY also enforces login verification", async () => {
   assert.equal(body.error, "Turnstile verification failed");
 });
 
+test("Turnstile rejects a token validated for another hostname", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response(
+    JSON.stringify({ success: true, hostname: "evil.example", action: "login" }),
+    { headers: { "content-type": "application/json" } }
+  );
+  try {
+    const response = await worker.fetch(
+      new Request("https://example.com/api/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ username: "admin", password: "Valid-Pass123!", turnstileToken: "valid-token" }),
+      }),
+      { ...envWithDb(loginRiskDb()), TURNSTILE_SECRET_KEY: "turnstile-secret" },
+      ctx()
+    );
+    const body = await response.json();
+
+    assert.equal(response.status, 400);
+    assert.equal(body.error, "Turnstile verification failed");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("login rejects oversized passwords before user lookup", async () => {
   const db = loginRiskDb();
   const request = new Request("https://example.com/api/login", {
@@ -829,6 +881,20 @@ test("fresh API bearer sessions skip last_used_at writes", async () => {
   assert.equal((state.runs || []).some((sql) => sql.includes("UPDATE api_sessions SET last_used_at")), false);
 });
 
+test("API bearer sessions expire after their absolute lifetime", async () => {
+  const state = { createdAt: new Date(Date.now() - 91 * 24 * 60 * 60 * 1000).toISOString() };
+  const request = new Request("https://example.com/api/v1/me", {
+    headers: { Authorization: "Bearer access-token" },
+  });
+
+  const response = await worker.fetch(request, envWithDb(apiSessionDb(state)), ctx());
+  const body = await response.json();
+
+  assert.equal(response.status, 401);
+  assert.equal(body.error, "API bearer token required");
+  assert.equal((state.runs || []).some((sql) => sql.includes("UPDATE api_sessions SET last_used_at")), false);
+});
+
 test("web app data returns entries and groups in one request", async () => {
   const state = {};
   const request = new Request("https://example.com/api/app-data", {
@@ -846,6 +912,180 @@ test("web app data returns entries and groups in one request", async () => {
   assert.equal(body.entries[0].label, "Email");
   assert.equal(body.groups.length, 1);
   assert.equal(body.groups[0].name, "Work");
+  assert.equal((state.runs || []).some((sql) => sql.includes("login_risk_control")), false);
+});
+
+test("web users can persist a validated entry order", async () => {
+  const state = {};
+  const db = webAppDataDb(state);
+  const response = await worker.fetch(new Request("https://example.com/api/entries/order", {
+    method: "PATCH",
+    headers: {
+      Cookie: "__Host-session=web-token",
+      Origin: "https://example.com",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ orderedIds: [11] }),
+  }), envWithDb(db), ctx());
+  const body = await response.json();
+
+  assert.equal(response.status, 200);
+  assert.equal(body.ok, true);
+  assert.equal(state.batchSize, 1);
+  assert.ok(state.binds.some(({ sql, args }) => sql.includes("SET sort_order = ?") && args[0] === 0 && args[1] === 11));
+});
+
+test("entry ordering rejects duplicate ids before updating D1", async () => {
+  const state = {};
+  const db = webAppDataDb(state);
+  const response = await worker.fetch(new Request("https://example.com/api/entries/order", {
+    method: "PATCH",
+    headers: {
+      Cookie: "__Host-session=web-token",
+      Origin: "https://example.com",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ orderedIds: [11, 11] }),
+  }), envWithDb(db), ctx());
+  const body = await response.json();
+
+  assert.equal(response.status, 400);
+  assert.match(body.error, /unique positive integer ids/);
+  assert.equal(state.batchSize, undefined);
+});
+
+test("web sessions expire after their absolute lifetime", async () => {
+  const db = adminSessionDb();
+  db.state.sessionCreatedAt = new Date(Date.now() - 31 * 24 * 60 * 60 * 1000).toISOString();
+  const response = await worker.fetch(
+    new Request("https://example.com/api/me", {
+      headers: { Cookie: "__Host-session=web-token" },
+    }),
+    envWithDb(db),
+    ctx()
+  );
+  const body = await response.json();
+
+  assert.equal(response.status, 401);
+  assert.equal(body.error, "Unauthorized");
+});
+
+test("web TOTP vault returns only enabled TOTP seeds after a recent password step-up", async () => {
+  const secret = "JBSWY3DPEHPK3PXP";
+  const encryptedSecret = await encryptWorkerSecret(secret);
+  const db = adminSessionDb({
+    all(sql) {
+      if (!sql.includes("SELECT id, secret_enc")) return { results: [] };
+      return {
+        results: [
+          { id: 1, secret_enc: encryptedSecret, digits: 6, period: 30, algorithm: "SHA-256", otp_type: "totp", enabled: 1 },
+          { id: 2, secret_enc: encryptedSecret, digits: 6, period: 30, algorithm: "SHA-1", otp_type: "hotp", enabled: 1 },
+          { id: 3, secret_enc: encryptedSecret, digits: 6, period: 30, algorithm: "SHA-1", otp_type: "totp", enabled: 0 },
+        ],
+      };
+    },
+  });
+  db.state.stepUpAt = new Date().toISOString();
+  const response = await worker.fetch(
+    new Request("https://example.com/api/codes/vault", {
+      method: "POST",
+      headers: {
+        Cookie: "__Host-session=web-token",
+        Origin: "https://example.com",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ entryIds: [1, 2, 3, 1] }),
+    }),
+    envWithDb(db),
+    ctx()
+  );
+  const body = await response.json();
+
+  assert.equal(response.status, 200);
+  assert.equal(body.items.length, 1);
+  assert.deepEqual(body.items[0], { id: 1, secret, digits: 6, period: 30, algorithm: "SHA-256" });
+  assert.equal("secret_enc" in body.items[0], false);
+  assert.equal(response.headers.get("cache-control"), "no-store");
+});
+
+test("web TOTP vault requires a password step-up when the session is stale", async () => {
+  const db = adminSessionDb({
+    all() {
+      throw new Error("vault query must not run without step-up");
+    },
+  });
+  const response = await worker.fetch(
+    new Request("https://example.com/api/codes/vault", {
+      method: "POST",
+      headers: {
+        Cookie: "__Host-session=web-token",
+        Origin: "https://example.com",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ entryIds: [1] }),
+    }),
+    envWithDb(db),
+    ctx()
+  );
+  const body = await response.json();
+
+  assert.equal(response.status, 401);
+  assert.equal(body.error, "Current password confirmation required");
+});
+
+test("plaintext otpauth exports retain no-store and security headers", async () => {
+  const encryptedSecret = await encryptWorkerSecret("JBSWY3DPEHPK3PXP");
+  const db = adminSessionDb({
+    all(sql) {
+      if (!sql.includes("FROM totp_entries")) return { results: [] };
+      return {
+        results: [
+          { id: 1, user_id: 1, label: "Email", issuer: "Example", secret_enc: encryptedSecret, digits: 6, period: 30, algorithm: "SHA-1", otp_type: "totp", hotp_counter: 0, enabled: 1 },
+        ],
+      };
+    },
+  });
+  const response = await worker.fetch(
+    new Request("https://example.com/api/export/otpauth", {
+      method: "POST",
+      headers: {
+        Cookie: "__Host-session=web-token",
+        Origin: "https://example.com",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ confirmPassword: "correct horse battery" }),
+    }),
+    { ...envWithDb(db), ALLOW_PLAINTEXT_EXPORT: "true" },
+    ctx()
+  );
+
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("cache-control"), "no-store");
+  assert.equal(response.headers.get("X-Content-Type-Options"), "nosniff");
+  assert.equal(response.headers.get("Cross-Origin-Opener-Policy"), "same-origin");
+  assert.match(await response.text(), /^otpauth:\/\/totp\//);
+});
+
+test("scheduled maintenance cleans expired sessions and risk records outside user requests", async () => {
+  const statements = [];
+  const db = {
+    prepare(sql) {
+      const statement = {
+        bind() { return statement; },
+        async run() {
+          statements.push(sql);
+          return { meta: { changes: 1 } };
+        },
+      };
+      return statement;
+    },
+  };
+  const pending = [];
+  await worker.scheduled({}, envWithDb(db), { waitUntil(promise) { pending.push(promise); } });
+  await Promise.all(pending);
+
+  assert.ok(statements.some((sql) => sql.includes("DELETE FROM sessions")));
+  assert.ok(statements.some((sql) => sql.includes("DELETE FROM login_risk_control")));
 });
 
 test("cookie-authenticated writes require same-origin JSON requests", async () => {
@@ -2018,6 +2258,40 @@ test("JSON import accepts SHA-1 and missing OTP algorithms", async () => {
   assert.equal(inserts.length, 3);
   assert.equal(inserts[0].args[1], "good");
   assert.equal(inserts[0].args[6], "SHA-256");
+});
+
+test("JSON import preserves disabled HOTP entries while batching valid rows", async () => {
+  const db = entryCaptureDb();
+  const response = await worker.fetch(
+    new Request("https://example.com/api/import", {
+      method: "POST",
+      headers: {
+        Cookie: "__Host-session=web-token",
+        Origin: "https://example.com",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        entries: [{
+          label: "Offline token",
+          secret: "JBSWY3DPEHPK3PXP",
+          otp_type: "hotp",
+          hotp_counter: 42,
+          enabled: false,
+          algorithm: "SHA-512",
+        }],
+      }),
+    }),
+    envWithDb(db),
+    ctx()
+  );
+  const body = await response.json();
+
+  assert.equal(response.status, 200);
+  assert.deepEqual(body.imported, { groups: 0, entries: 1 });
+  assert.equal(db.state.entryInserts.length, 1);
+  assert.equal(db.state.entryInserts[0][7], "hotp");
+  assert.equal(db.state.entryInserts[0][8], 42);
+  assert.equal(db.state.entryInserts[0][9], 0);
 });
 
 test("OTP secret validation rejects unsafe lengths for create, update, and JSON import", async () => {

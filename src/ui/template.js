@@ -22,6 +22,7 @@ function brand() {
 export function renderAppHtml(env, nonce) {
   const turnstileSiteKey = String((env && env.TURNSTILE_SITE_KEY) || "");
   const plaintextExportEnabled = String((env && env.ALLOW_PLAINTEXT_EXPORT) || "").toLowerCase() === "true";
+  const webTotpMode = String((env && env.WEB_TOTP_MODE) || "browser").toLowerCase() === "worker" ? "worker" : "browser";
   return `<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -174,7 +175,7 @@ export function renderAppHtml(env, nonce) {
   </dialog>
 
   <div id="toastRegion" class="toast-region" aria-live="polite" aria-atomic="true"></div>
-  <script nonce="${nonce}">const TURNSTILE_SITE_KEY=${JSON.stringify(turnstileSiteKey)};const PLAINTEXT_EXPORT_ENABLED=${JSON.stringify(plaintextExportEnabled)};${CLIENT_SCRIPT}</script>
+  <script nonce="${nonce}">const TURNSTILE_SITE_KEY=${JSON.stringify(turnstileSiteKey)};const PLAINTEXT_EXPORT_ENABLED=${JSON.stringify(plaintextExportEnabled)};const WEB_TOTP_MODE=${JSON.stringify(webTotpMode)};${CLIENT_SCRIPT}</script>
 </body>
 </html>`;
 }

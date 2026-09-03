@@ -1,7 +1,7 @@
 {
   "name": "2fauth-cloudflare",
   "main": "src/worker.js",
-  "compatibility_date": "2025-01-01",
+  "compatibility_date": "2026-08-14",
   "d1_databases": [
     {
       "binding": "DB",
@@ -10,6 +10,11 @@
     }
   ],
   "vars": {
-    "ALLOW_PLAINTEXT_EXPORT": "false"
-  }
+    "ALLOW_PLAINTEXT_EXPORT": "false",
+    "WEB_TOTP_MODE": "browser"
+  },
+  "triggers": {
+    "crons": ["0 */6 * * *"]
+  },
+  "minify": true
 }
