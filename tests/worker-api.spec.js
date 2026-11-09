@@ -581,6 +581,15 @@ test("web UI client keeps authentication and form submission recovery paths", ()
   assert.match(CLIENT_SCRIPT, /entryForm: "save-entry"/);
   assert.match(CLIENT_SCRIPT, /groupForm: "create-group"/);
   assert.match(CLIENT_SCRIPT, /riskForm: "save-login-policy"/);
+  assert.match(CLIENT_SCRIPT, /encryptedBackupDetail: "Set a backup passphrase of at least 12 characters/);
+  assert.match(CLIENT_SCRIPT, /name: "passphrase", label: t\("backupPassphraseLabel"\), type: "password", minlength: 12/);
+});
+
+test("web UI keeps the login session for 30 days across page reloads", () => {
+  assert.match(CLIENT_SCRIPT, /storedAutoLogoutMinutes === null \|\| storedAutoLogoutMinutes === "30" \? "43200"/);
+  assert.match(CLIENT_SCRIPT, /option\.value === "43200"\) option\.textContent = currentLang === "zh-CN" \? "30 天" : "30 days"/);
+  assert.doesNotMatch(CLIENT_SCRIPT, /window\.addEventListener\("pagehide", closeSoonOnLeave\)/);
+  assert.doesNotMatch(CLIENT_SCRIPT, /window\.addEventListener\("beforeunload", closeSoonOnLeave\)/);
 });
 
 test("web UI marks the OTP search as a non-credential field", async () => {
