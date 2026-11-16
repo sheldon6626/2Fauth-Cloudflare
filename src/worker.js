@@ -1,9 +1,12 @@
 const SESSION_COOKIE = "__Host-session";
 const SESSION_TTL_SECONDS = 60 * 60 * 24 * 30; // 30 days
+// Keep an absolute upper bound so an actively used stolen token cannot live forever.
+const SESSION_ABSOLUTE_TTL_SECONDS = 60 * 60 * 24 * 30;
 import { renderAppHtml } from "./ui/template.js";
 const STEP_UP_TTL_SECONDS = 5 * 60; // 5 minutes
 const API_ACCESS_TTL_SECONDS = 60 * 60 * 24 * 7; // 7 days
 const API_REFRESH_TTL_SECONDS = 60 * 60 * 24 * 90; // 90 days
+const API_ABSOLUTE_TTL_SECONDS = 60 * 60 * 24 * 90;
 const CLOSE_LOGOUT_GRACE_SECONDS = 12;
 const CLOSE_SOON_HEADER = "x-session-close";
 const CLOSE_SOON_HEADER_VALUE = "web-beforeunload";
@@ -35,10 +38,10 @@ const DEFAULT_TOTP_VERIFY_LOCK_MINUTES = 5;
 const DEFAULT_HOTP_CONSUME_MAX_REQUESTS_PER_MINUTE = 5;
 const DEFAULT_HOTP_CONSUME_LOCK_MINUTES = 5;
 const ENCRYPTION_KEY_CACHE_TTL_MS = 5 * 60 * 1000;
-const BACKGROUND_MAINTENANCE_INTERVAL_MS = 15 * 60 * 1000;
 const API_SESSION_LAST_USED_UPDATE_INTERVAL_SECONDS = 15 * 60;
 const ENTRY_LABEL_MAX_LENGTH = 200;
 const ENTRY_ISSUER_MAX_LENGTH = 100;
+const ENTRY_REORDER_MAX_IDS = 500;
 const OTP_ALGORITHM_DEFAULT = "SHA-1";
 const OTP_ALGORITHM_ERROR = "algorithm must be SHA-1, SHA-256, or SHA-512";
 const GROUP_NAME_MAX_LENGTH = 60;
@@ -48,6 +51,7 @@ const OTP_SECRET_MAX_BASE32_CHARS = 256;
 const OTP_SECRET_MIN_BYTES = 10;
 const OTP_SECRET_MAX_BYTES = 128;
 const TURNSTILE_VERIFY_URL = "https://challenges.cloudflare.com/turnstile/v0/siteverify";
+const TURNSTILE_REQUEST_TIMEOUT_MS = 5000;
 const ANDROID_CLIENT_TYPE = "android";
 const EXTENSION_CLIENT_TYPE = "edge_extension";
 const EXTENSION_BATCH_MAX_IDS = 100;
@@ -63,7 +67,7 @@ const BOOTSTRAP_TOKEN_HEADER = "x-bootstrap-token";
 const CORS_ALLOWED_HEADERS = "Content-Type, Authorization, X-Client-Type, X-Bootstrap-Token, X-Init-Secret";
 const CORS_ALLOWED_METHODS = "GET, POST, PATCH, DELETE, OPTIONS";
 
-let nextBackgroundMaintenanceAt = 0;
+const VAULT_MAX_IDS = 90;
 
 const API_ROUTES = [
   ["GET", "/api/status", handleStatus],
@@ -97,6 +101,7 @@ const API_ROUTES = [
   ...entryRoutes("/api"),
   ...groupRoutes("/api"),
   ["POST", "/api/codes/batch", handleWebCodesBatch],
+  ["POST", "/api/codes/vault", handleCodesVault],
   ["GET", "/api/export", handleExportData],
   ["POST", "/api/export", handleExportData],
   ["POST", "/api/export/otpauth", handleExportOtpAuth],
@@ -117,6 +122,7 @@ function entryRoutes(prefix) {
   return [
     ["GET", `${prefix}/entries`, handleListEntries],
     ["POST", `${prefix}/entries`, handleCreateEntry],
+    ["PATCH", `${prefix}/entries/order`, handleReorderEntries],
     ["PATCH", routePattern(prefix, `/entries/${DB_ID_PATH_PATTERN}`), handleUpdateEntry],
     ["GET", routePattern(prefix, `/entries/${DB_ID_PATH_PATTERN}/code`), handleEntryCode],
     ["POST", routePattern(prefix, `/entries/${DB_ID_PATH_PATTERN}/verify`), handleVerifyTotp],
@@ -167,7 +173,6 @@ export default {
 
       const route = findApiRoute(method, path);
       if (route) {
-        scheduleBackgroundMaintenance(ctx, env, path);
         const authMixViolation = validateAuthMethodConsistency(request);
         if (authMixViolation) return withCors(request, authMixViolation, env);
         const cookieWriteViolation = validateCookieWriteRequest(request);
@@ -197,6 +202,12 @@ export default {
       }
       return withCors(request, json(payload, 500), env);
     }
+  },
+  async scheduled(controller, env, ctx) {
+    const maintenance = runBackgroundMaintenance(env).catch((error) => {
+      console.error(JSON.stringify({ message: "scheduled maintenance failed", cron: controller.cron, error: String(error?.message || error) }));
+    });
+    ctx.waitUntil(maintenance);
   },
 };
 
@@ -283,7 +294,7 @@ async function handleLogin(request, env) {
   if (!username || !password) return json({ error: "Username and password are required" }, 400);
   if (!validPasswordLength(password)) return json({ error: "Invalid credentials" }, 401);
   if (hasTurnstileSecret(env)) {
-    const ts = await verifyTurnstileToken(turnstileToken, clientIp(request), env);
+    const ts = await verifyTurnstileToken(turnstileToken, clientIp(request), env, request);
     if (!ts.ok) {
       return json({ error: "Turnstile verification failed" }, 400);
     }
@@ -403,7 +414,7 @@ async function loginForApiClient(request, env, clientType) {
   if (!username || !password) return json({ error: "Username and password are required" }, 400);
   if (!validPasswordLength(password)) return json({ error: "Invalid credentials" }, 401);
   if (hasTurnstileSecret(env)) {
-    const ts = await verifyTurnstileToken(turnstileToken, clientIp(request), env);
+    const ts = await verifyTurnstileToken(turnstileToken, clientIp(request), env, request);
     if (!ts.ok) {
       return json({ error: "Turnstile verification failed" }, 400);
     }
@@ -474,7 +485,7 @@ async function handleExtensionLogin(request, env) {
   // F-01 fix: Turnstile verification was missing, allowing CAPTCHA bypass via extension login
   const turnstileToken = String(body.turnstileToken || "");
   if (hasTurnstileSecret(env)) {
-    const ts = await verifyTurnstileToken(turnstileToken, clientIp(request), env);
+    const ts = await verifyTurnstileToken(turnstileToken, clientIp(request), env, request);
     if (!ts.ok) {
       return json({ error: "Turnstile verification failed" }, 400);
     }
@@ -570,8 +581,6 @@ async function handleCodesBatchForAuth(request, env, auth) {
     return json({ error: `entryIds cannot exceed ${EXTENSION_BATCH_MAX_IDS}` }, 400);
   }
 
-  // F-01: safe IN-clause query builder 鈥?no string interpolation of SQL.
-  // Every element was already validated as a positive integer above.
   const { placeholders, params: inParams } = buildInClause(normalizedIds);
   let query = `SELECT id, user_id, secret_enc, digits, period, algorithm, otp_type, hotp_counter, enabled FROM totp_entries WHERE id IN (${placeholders})`;
   const baseParams = [...inParams];
@@ -633,10 +642,66 @@ async function handleCodesBatchForAuth(request, env, auth) {
     }
   }
 
-  return json({
-    serverTime: nowSec,
-    items,
-  });
+  return json({ serverTime: nowSec, items });
+}
+
+async function handleCodesVault(request, env) {
+  const auth = await requireWebSession(request, env);
+  if (!auth.ok) return auth.response;
+
+  const body = await parseJson(request);
+  if (!Array.isArray(body.entryIds)) return json({ error: "entryIds must be an array" }, 400);
+
+  const entryIds = [];
+  const uniqueIds = new Set();
+  for (const rawId of body.entryIds) {
+    const id = Number(rawId);
+    if (!Number.isSafeInteger(id) || id <= 0) {
+      return json({ error: "entryIds must contain positive integer ids" }, 400);
+    }
+    if (!uniqueIds.has(id)) {
+      uniqueIds.add(id);
+      entryIds.push(id);
+    }
+  }
+  if (entryIds.length === 0) return json({ error: "entryIds cannot be empty" }, 400);
+  if (entryIds.length > VAULT_MAX_IDS) {
+    return json({ error: `entryIds cannot exceed ${VAULT_MAX_IDS}` }, 400);
+  }
+
+  const stepUp = await requireRecentWebStepUp(request, env, auth, body);
+  if (stepUp) return stepUp;
+
+  const { placeholders, params: inParams } = buildInClause(entryIds);
+  let query = `SELECT id, secret_enc, digits, period, algorithm, otp_type, enabled FROM totp_entries WHERE id IN (${placeholders})`;
+  const params = [...inParams];
+  if (auth.user.role !== "admin") {
+    query += " AND user_id = ?";
+    params.push(auth.user.id);
+  }
+  const result = await env.DB.prepare(query).bind(...params).all();
+  const rowsById = new Map((result.results || []).map((row) => [Number(row.id), row]));
+  const items = [];
+
+  for (const id of entryIds) {
+    const row = rowsById.get(id);
+    if (!row || !entryEnabled(row.enabled) || (row.otp_type || "totp") !== "totp") continue;
+    const algorithm = normalizeAlgorithm(row.algorithm || OTP_ALGORITHM_DEFAULT);
+    if (!algorithm) continue;
+    try {
+      items.push({
+        id,
+        secret: await decryptText(row.secret_enc, env),
+        digits: normalizeOtpDigits(row.digits),
+        period: normalizeTotpPeriod(row.period),
+        algorithm,
+      });
+    } catch {
+      // Do not expose decryption details or encrypted material to the client.
+    }
+  }
+
+  return json({ serverTime: Math.floor(Date.now() / 1000), items });
 }
 
 async function handleLogout(request, env) {
@@ -706,17 +771,52 @@ async function handleListEntries(request, env) {
 async function listEntriesForAuth(env, auth) {
   if (auth.user.role === "admin") {
     const rows = await env.DB.prepare(
-      "SELECT e.id, e.user_id, u.username, e.label, e.issuer, e.digits, e.period, e.algorithm, e.otp_type, e.hotp_counter, e.enabled, e.group_id, g.name AS group_name, g.color AS group_color, e.created_at FROM totp_entries e JOIN users u ON u.id = e.user_id LEFT JOIN groups g ON g.id = e.group_id ORDER BY e.id DESC"
+      "SELECT e.id, e.user_id, u.username, e.label, e.issuer, e.digits, e.period, e.algorithm, e.otp_type, e.hotp_counter, e.enabled, e.group_id, e.sort_order, g.name AS group_name, g.color AS group_color, e.created_at FROM totp_entries e JOIN users u ON u.id = e.user_id LEFT JOIN groups g ON g.id = e.group_id ORDER BY e.enabled DESC, e.sort_order ASC, e.id DESC"
     ).all();
     return rows.results || [];
   }
 
   const rows = await env.DB.prepare(
-    "SELECT e.id, e.user_id, e.label, e.issuer, e.digits, e.period, e.algorithm, e.otp_type, e.hotp_counter, e.enabled, e.group_id, g.name AS group_name, g.color AS group_color, e.created_at FROM totp_entries e LEFT JOIN groups g ON g.id = e.group_id WHERE e.user_id = ? ORDER BY e.id DESC"
+    "SELECT e.id, e.user_id, e.label, e.issuer, e.digits, e.period, e.algorithm, e.otp_type, e.hotp_counter, e.enabled, e.group_id, e.sort_order, g.name AS group_name, g.color AS group_color, e.created_at FROM totp_entries e LEFT JOIN groups g ON g.id = e.group_id WHERE e.user_id = ? ORDER BY e.enabled DESC, e.sort_order ASC, e.id DESC"
   )
     .bind(auth.user.id)
     .all();
   return rows.results || [];
+}
+
+async function handleReorderEntries(request, env) {
+  const auth = await requireRouteSession(request, env);
+  if (!auth.ok) return auth.response;
+
+  const body = await parseJson(request);
+  const orderedIds = Array.isArray(body.orderedIds) ? body.orderedIds.map(Number) : null;
+  if (!orderedIds || orderedIds.length > ENTRY_REORDER_MAX_IDS) {
+    return json({ error: `orderedIds must be an array with at most ${ENTRY_REORDER_MAX_IDS} items` }, 400);
+  }
+  if (orderedIds.some((id) => !Number.isSafeInteger(id) || id <= 0) || new Set(orderedIds).size !== orderedIds.length) {
+    return json({ error: "orderedIds must contain unique positive integer ids" }, 400);
+  }
+  if (!orderedIds.length) return json({ ok: true });
+
+  const allowedIds = new Set();
+  for (let offset = 0; offset < orderedIds.length; offset += VAULT_MAX_IDS) {
+    const chunk = orderedIds.slice(offset, offset + VAULT_MAX_IDS);
+    const placeholders = chunk.map(() => "?").join(",");
+    let statement = env.DB.prepare(`SELECT id FROM totp_entries WHERE id IN (${placeholders})`);
+    const bindings = [...chunk];
+    if (auth.user.role !== "admin") {
+      statement = env.DB.prepare(`SELECT id FROM totp_entries WHERE id IN (${placeholders}) AND user_id = ?`);
+      bindings.push(auth.user.id);
+    }
+    const rows = await statement.bind(...bindings).all();
+    (rows.results || []).forEach((row) => allowedIds.add(Number(row.id)));
+  }
+  if (allowedIds.size !== orderedIds.length) return json({ error: "One or more entries are unavailable" }, 403);
+
+  await env.DB.batch(orderedIds.map((id, index) => (
+    env.DB.prepare("UPDATE totp_entries SET sort_order = ? WHERE id = ?").bind(index, id)
+  )));
+  return json({ ok: true });
 }
 
 async function handleCreateEntry(request, env) {
@@ -1054,6 +1154,7 @@ async function handleExportOtpAuth(request, env) {
       "content-type": "text/plain; charset=utf-8",
       "cache-control": "no-store",
       "content-disposition": `attachment; filename="otpauth-export-${Date.now()}.txt"`,
+      ...commonSecurityHeaders(),
     },
   });
 }
@@ -1222,6 +1323,9 @@ async function getExportPayload(auth, env) {
 }
 
 async function importPayload(body, auth, env) {
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return json({ error: "import payload must be an object" }, 400);
+  }
   const groups = Array.isArray(body.groups) ? body.groups : [];
   const entries = Array.isArray(body.entries) ? body.entries : [];
 
@@ -1249,28 +1353,55 @@ async function importPayload(body, auth, env) {
     if (!exists) return json({ error: "userId does not exist" }, 400);
   }
 
-  const groupMap = new Map();
+  const normalizedGroups = [];
   for (const g of groups) {
+    if (!g || typeof g !== "object") continue;
     const name = String(g.name || "").trim();
     if (!name) continue;
     if (name.length > GROUP_NAME_MAX_LENGTH) continue;
     const color = validHexColor(g.color) ? g.color : "#0f766e";
-    try {
-      const res = await env.DB.prepare(
-        "INSERT INTO groups (user_id, name, color, created_at) VALUES (?, ?, ?, ?)"
-      )
-        .bind(userId, name, color, nowIso())
-        .run();
-      const newId = normalizeDbId(res.meta?.last_row_id);
-      groupMap.set(String(g.id), newId);
-      imported.groups += 1;
-    } catch {
-      const exists = await env.DB.prepare("SELECT id FROM groups WHERE user_id = ? AND name = ?").bind(userId, name).first();
-      if (exists) groupMap.set(String(g.id), normalizeDbId(exists.id));
-    }
+    normalizedGroups.push({ sourceId: String(g.id), name, color });
   }
 
+  const uniqueGroupNames = [...new Set(normalizedGroups.map((group) => group.name))];
+  const existingGroupsByName = new Map();
+  if (uniqueGroupNames.length) {
+    const { placeholders, params } = buildInClause(uniqueGroupNames);
+    const result = await env.DB.prepare(
+      `SELECT id, name FROM groups WHERE user_id = ? AND name IN (${placeholders})`
+    ).bind(userId, ...params).all();
+    (result.results || []).forEach((group) => existingGroupsByName.set(String(group.name), normalizeDbId(group.id)));
+  }
+
+  const groupsToInsert = [];
+  const seenGroupNames = new Set(existingGroupsByName.keys());
+  for (const group of normalizedGroups) {
+    if (seenGroupNames.has(group.name)) continue;
+    seenGroupNames.add(group.name);
+    groupsToInsert.push(group);
+  }
+  for (let start = 0; start < groupsToInsert.length; start += 40) {
+    const chunk = groupsToInsert.slice(start, start + 40);
+    const statements = chunk.map((group) => env.DB.prepare(
+      "INSERT OR IGNORE INTO groups (user_id, name, color, created_at) VALUES (?, ?, ?, ?)"
+    ).bind(userId, group.name, group.color, nowIso()));
+    const results = await runD1Batch(env, statements);
+    imported.groups += results.reduce((count, result) => count + Number(result?.meta?.changes || 0), 0);
+  }
+
+  const groupsByName = new Map(existingGroupsByName);
+  if (uniqueGroupNames.length) {
+    const { placeholders, params } = buildInClause(uniqueGroupNames);
+    const result = await env.DB.prepare(
+      `SELECT id, name FROM groups WHERE user_id = ? AND name IN (${placeholders})`
+    ).bind(userId, ...params).all();
+    (result.results || []).forEach((group) => groupsByName.set(String(group.name), normalizeDbId(group.id)));
+  }
+  const groupMap = new Map(normalizedGroups.map((group) => [group.sourceId, groupsByName.get(group.name) || null]));
+
+  const normalizedEntries = [];
   for (const e of entries) {
+    if (!e || typeof e !== "object") continue;
     const label = String(e.label || "").trim();
     const issuer = String(e.issuer || "").trim();
     if (!e.secret || !label) continue;
@@ -1286,21 +1417,45 @@ async function importPayload(body, auth, env) {
       const period = normalizeTotpPeriod(e.period);
       const hotpCounter = normalizeHotpCounter(e.hotp_counter);
       const enabled = e.enabled === undefined ? 1 : booleanFlag(e.enabled);
-      if (enabled === false) continue;
-      const secretEnc = await encryptText(secret, env);
-
-      await env.DB.prepare(
-        "INSERT INTO totp_entries (user_id, label, issuer, secret_enc, digits, period, algorithm, otp_type, hotp_counter, enabled, group_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-      )
-        .bind(userId, label, issuer, secretEnc, digits, period, algorithm, otpType, hotpCounter, enabled, groupId, nowIso())
-        .run();
-      imported.entries += 1;
+      normalizedEntries.push({ label, issuer, secret, groupId, otpType, digits, period, algorithm, hotpCounter, enabled });
     } catch {
       continue;
     }
   }
 
+  for (let start = 0; start < normalizedEntries.length; start += 40) {
+    const chunk = normalizedEntries.slice(start, start + 40);
+    const prepared = await Promise.all(chunk.map(async (entry) => ({
+      ...entry,
+      secretEnc: await encryptText(entry.secret, env),
+    })));
+    const statements = prepared.map((entry) => env.DB.prepare(
+      "INSERT INTO totp_entries (user_id, label, issuer, secret_enc, digits, period, algorithm, otp_type, hotp_counter, enabled, group_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    ).bind(userId, entry.label, entry.issuer, entry.secretEnc, entry.digits, entry.period, entry.algorithm, entry.otpType, entry.hotpCounter, entry.enabled, entry.groupId, nowIso()));
+    try {
+      await runD1Batch(env, statements);
+      imported.entries += prepared.length;
+    } catch {
+      for (const entry of prepared) {
+        try {
+          await env.DB.prepare(
+            "INSERT INTO totp_entries (user_id, label, issuer, secret_enc, digits, period, algorithm, otp_type, hotp_counter, enabled, group_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+          ).bind(userId, entry.label, entry.issuer, entry.secretEnc, entry.digits, entry.period, entry.algorithm, entry.otpType, entry.hotpCounter, entry.enabled, entry.groupId, nowIso()).run();
+          imported.entries += 1;
+        } catch {}
+      }
+    }
+  }
+
   return json({ ok: true, imported });
+}
+
+async function runD1Batch(env, statements) {
+  if (!statements.length) return [];
+  if (typeof env.DB.batch === "function") return env.DB.batch(statements);
+  const results = [];
+  for (const statement of statements) results.push(await statement.run());
+  return results;
 }
 
 async function handleExportDataEncrypted(request, env) {
@@ -1976,6 +2131,7 @@ function shouldRateLimitRoute(request, route) {
   if (request.method.toUpperCase() === "OPTIONS") return false;
   const path = new URL(request.url).pathname;
   if (path === "/api/status" || path === "/api/v1/capabilities") return false;
+  if (request.method.toUpperCase() === "GET" && ["/api/me", "/api/app-data"].includes(path)) return false;
   if (
     [
       "/api/login",
@@ -2033,7 +2189,7 @@ function clientIp(request) {
   return value || "unknown";
 }
 
-async function verifyTurnstileToken(token, remoteip, env) {
+async function verifyTurnstileToken(token, remoteip, env, request) {
   const secretKey = String(env.TURNSTILE_SECRET_KEY || env.TURNSTILE_KEY || "");
   if (!secretKey) return { ok: false };
   if (!token) return { ok: false };
@@ -2041,14 +2197,44 @@ async function verifyTurnstileToken(token, remoteip, env) {
   body.set("secret", secretKey);
   body.set("response", token);
   if (remoteip) body.set("remoteip", remoteip);
-  const resp = await fetch(TURNSTILE_VERIFY_URL, {
-    method: "POST",
-    headers: { "content-type": "application/x-www-form-urlencoded" },
-    body: body.toString(),
-  });
-  if (!resp.ok) return { ok: false };
-  const data = await resp.json().catch(() => ({}));
-  return { ok: !!data.success };
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), TURNSTILE_REQUEST_TIMEOUT_MS);
+  try {
+    const resp = await fetch(TURNSTILE_VERIFY_URL, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: body.toString(),
+      signal: controller.signal,
+    });
+    if (!resp.ok) return { ok: false };
+    const data = await resp.json().catch(() => ({}));
+    if (!data.success || !turnstileHostnameMatchesRequest(data.hostname, request, env)) return { ok: false };
+    // Tokens from older clients may omit action. If an action is returned,
+    // require the login action so a token minted for another flow cannot be reused.
+    if (data.action && String(data.action).toLowerCase() !== "login") return { ok: false };
+    return { ok: true };
+  } catch {
+    return { ok: false };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function turnstileHostnameMatchesRequest(hostname, request, env) {
+  const reported = String(hostname || "").trim().toLowerCase();
+  if (!reported) return false;
+  const configured = String(env.TURNSTILE_ALLOWED_HOSTNAMES || "")
+    .split(",")
+    .map((value) => value.trim().toLowerCase())
+    .filter(Boolean);
+  let requestHostname = "";
+  try {
+    requestHostname = new URL(request.url).hostname.toLowerCase();
+  } catch {
+    return false;
+  }
+  const allowed = configured.length ? configured : [requestHostname];
+  return allowed.includes(reported);
 }
 
 async function requireWebSession(request, env) {
@@ -2104,7 +2290,7 @@ async function getCurrentApiSession(request, env) {
   let row = null;
   try {
     row = await env.DB.prepare(
-      "SELECT s.id AS session_id, s.client_type, s.last_used_at, u.id, u.username, u.role FROM api_sessions s JOIN users u ON u.id = s.user_id WHERE s.token_hash = ? AND s.expires_at > ?"
+      "SELECT s.id AS session_id, s.client_type, s.last_used_at, s.created_at, u.id, u.username, u.role FROM api_sessions s JOIN users u ON u.id = s.user_id WHERE s.token_hash = ? AND s.expires_at > ?"
     )
       .bind(tokenHash, now)
       .first();
@@ -2112,6 +2298,7 @@ async function getCurrentApiSession(request, env) {
     if (!isMissingTableError(err, "api_sessions")) throw err;
   }
   if (!row) return null;
+  if (!isWithinAbsoluteSessionLifetime(row.created_at, API_ABSOLUTE_TTL_SECONDS, nowMs)) return null;
   if (shouldUpdateApiSessionLastUsed(row.last_used_at, nowMs)) {
     await env.DB.prepare("UPDATE api_sessions SET last_used_at = ? WHERE id = ?").bind(now, row.session_id).run();
   }
@@ -2129,15 +2316,16 @@ async function getCurrentWebSession(request, env) {
   const tokenHash = await hashSessionToken(token, env);
   const now = nowIso();
   const queries = [
-    "SELECT s.id AS session_id, s.step_up_at, u.id, u.username, u.role FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token_hash = ? AND s.expires_at > ? AND s.client_type = 'web'",
-    "SELECT s.id AS session_id, u.id, u.username, u.role FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token_hash = ? AND s.expires_at > ? AND s.client_type = 'web'",
-    "SELECT s.id AS session_id, u.id, u.username, u.role FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token_hash = ? AND s.expires_at > ?",
+    "SELECT s.id AS session_id, s.step_up_at, s.created_at, u.id, u.username, u.role FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token_hash = ? AND s.expires_at > ? AND s.client_type = 'web'",
+    "SELECT s.id AS session_id, s.created_at, u.id, u.username, u.role FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token_hash = ? AND s.expires_at > ? AND s.client_type = 'web'",
+    "SELECT s.id AS session_id, s.created_at, u.id, u.username, u.role FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token_hash = ? AND s.expires_at > ?",
   ];
   let lastMissingColumn = null;
   for (const sql of queries) {
     try {
       const row = await env.DB.prepare(sql).bind(tokenHash, now).first();
       if (!row) return null;
+      if (!isWithinAbsoluteSessionLifetime(row.created_at, SESSION_ABSOLUTE_TTL_SECONDS)) return null;
       return {
         user: { id: row.id, username: row.username, role: row.role },
         sessionKind: "web",
@@ -2212,16 +2400,6 @@ async function cleanExpiredSessions(env) {
   }
 }
 
-function scheduleBackgroundMaintenance(ctx, env, path) {
-  if (!ctx || typeof ctx.waitUntil !== "function") return;
-  if (path === "/api/status" || path === "/api/v1/capabilities") return;
-
-  const now = Date.now();
-  if (now < nextBackgroundMaintenanceAt) return;
-  nextBackgroundMaintenanceAt = now + BACKGROUND_MAINTENANCE_INTERVAL_MS;
-  ctx.waitUntil(runBackgroundMaintenance(env).catch(() => {}));
-}
-
 async function runBackgroundMaintenance(env) {
   await Promise.all([
     cleanExpiredSessions(env),
@@ -2232,18 +2410,36 @@ async function runBackgroundMaintenance(env) {
 async function insertWebSession(env, userId, tokenHash, expiresAt, createdAt) {
   try {
     return await env.DB.prepare(
-      "INSERT INTO sessions (user_id, token_hash, client_type, expires_at, created_at) VALUES (?, ?, 'web', ?, ?)"
+      "INSERT INTO sessions (user_id, token_hash, client_type, expires_at, created_at, step_up_at) VALUES (?, ?, 'web', ?, ?, ?)"
     )
-      .bind(userId, tokenHash, expiresAt, createdAt)
+      .bind(userId, tokenHash, expiresAt, createdAt, createdAt)
       .run();
   } catch (err) {
-    if (!isMissingColumnError(err, "client_type")) throw err;
-    return env.DB.prepare(
-      "INSERT INTO sessions (user_id, token_hash, expires_at, created_at) VALUES (?, ?, ?, ?)"
-    )
-      .bind(userId, tokenHash, expiresAt, createdAt)
-      .run();
+    if (!isMissingColumnError(err, "step_up_at") && !isMissingColumnError(err, "client_type")) throw err;
+    try {
+      return await env.DB.prepare(
+        "INSERT INTO sessions (user_id, token_hash, client_type, expires_at, created_at) VALUES (?, ?, 'web', ?, ?)"
+      )
+        .bind(userId, tokenHash, expiresAt, createdAt)
+        .run();
+    } catch (fallbackErr) {
+      if (!isMissingColumnError(fallbackErr, "client_type")) throw fallbackErr;
+      return env.DB.prepare(
+        "INSERT INTO sessions (user_id, token_hash, expires_at, created_at) VALUES (?, ?, ?, ?)"
+      )
+        .bind(userId, tokenHash, expiresAt, createdAt)
+        .run();
+    }
   }
+}
+
+function isWithinAbsoluteSessionLifetime(createdAt, maxAgeSeconds, nowMs = Date.now()) {
+  const createdMs = Date.parse(String(createdAt || ""));
+  // Legacy test fixtures and pre-existing non-standard rows may not expose a
+  // creation timestamp. The normal schema always has one; preserve those rows
+  // until they naturally expire rather than treating missing metadata as fresh.
+  if (!Number.isFinite(createdMs)) return true;
+  return nowMs - createdMs <= maxAgeSeconds * 1000;
 }
 
 async function updateWebSessionExpiry(env, tokenHash, expiresAt) {
@@ -2311,11 +2507,14 @@ async function rotateApiSessionTokens(request, env, expectedClientType, options 
   const refreshHash = await hashSessionToken(refreshToken, env);
   const now = nowIso();
   const row = await env.DB.prepare(
-    "SELECT s.id, s.client_type, s.user_id, u.username, u.role FROM api_sessions s JOIN users u ON u.id = s.user_id WHERE s.refresh_hash = ? AND s.refresh_expires_at > ?"
+    "SELECT s.id, s.client_type, s.created_at, s.user_id, u.username, u.role FROM api_sessions s JOIN users u ON u.id = s.user_id WHERE s.refresh_hash = ? AND s.refresh_expires_at > ?"
   )
     .bind(refreshHash, now)
     .first();
   if (!row) return json({ error: "Invalid refresh token" }, 401);
+  if (!isWithinAbsoluteSessionLifetime(row.created_at, API_ABSOLUTE_TTL_SECONDS)) {
+    return json({ error: "Refresh token expired" }, 401);
+  }
 
   if (expectedClientType === ANDROID_CLIENT_TYPE && String(row.client_type || "") !== ANDROID_CLIENT_TYPE) {
     return json({ error: "Invalid refresh token" }, 401);
@@ -2977,7 +3176,8 @@ function b64ToBytes(b64) {
 function corsPreflight(request, env) {
   const origin = allowedCorsOrigin(request, env);
   if (!origin) return new Response(null, { status: 403 });
-  const headers = corsHeaders(origin, env);
+  const headers = new Headers(commonSecurityHeaders());
+  for (const [key, value] of corsHeaders(origin, env)) headers.set(key, value);
   headers.set("Access-Control-Max-Age", "86400");
   headers.set("Vary", "Origin");
   return new Response(null, { status: 204, headers });
@@ -3060,6 +3260,10 @@ function commonSecurityHeaders() {
     "X-Frame-Options": "DENY",
     "X-XSS-Protection": "1; mode=block",
     "Referrer-Policy": "strict-origin-when-cross-origin",
+    "Permissions-Policy": "camera=(self), clipboard-write=(self), geolocation=(), microphone=(), payment=(), usb=()",
+    "Cross-Origin-Opener-Policy": "same-origin",
+    "Origin-Agent-Cluster": "?1",
+    "X-Permitted-Cross-Domain-Policies": "none",
   };
 }
 
@@ -3109,9 +3313,13 @@ function html(markup, nonce) {
         "default-src 'self'",
         `script-src ${scriptSrc.join(" ")}`,
         `style-src ${styleSrc.join(" ")}`,
+        "style-src-attr 'unsafe-inline'",
         "img-src 'self' data: blob:",
+        "media-src 'self' blob:",
         "connect-src 'self' https://challenges.cloudflare.com",
         "frame-src https://challenges.cloudflare.com",
+        "object-src 'none'",
+        "manifest-src 'self'",
         "base-uri 'none'",
         "frame-ancestors 'none'",
         "form-action 'self'",

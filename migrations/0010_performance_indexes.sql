@@ -1,0 +1,1 @@
+CREATE INDEX IF NOT EXISTS idx_totp_entries_user_type_enabled_id ON totp_entries(user_id, otp_type, enabled, id);
