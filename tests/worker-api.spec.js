@@ -611,6 +611,12 @@ test("web UI client keeps authentication and form submission recovery paths", ()
   assert.match(CLIENT_SCRIPT, /byId\("actionFields"\)\.replaceChildren\(\)/);
 });
 
+test("web UI hides owner email badges while searching", () => {
+  assert.match(CLIENT_SCRIPT, /const isSearching = Boolean\(value\("search"\)\.trim\(\)\);/);
+  assert.match(CLIENT_SCRIPT, /list\.map\(\(entry\) => entryCardHtml\(entry, isSearching\)\)/);
+  assert.match(CLIENT_SCRIPT, /const ownerBadge = !isSearching && currentUser/);
+});
+
 test("web UI marks the OTP search as a non-credential field", async () => {
   const response = await worker.fetch(new Request("https://example.com/"), envWithDb(emptyDb()), ctx());
   const html = await response.text();

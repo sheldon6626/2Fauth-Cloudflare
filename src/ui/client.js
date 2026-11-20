@@ -374,25 +374,26 @@ export const CLIENT_SCRIPT = String.raw`
 
   function renderEntries() {
     const list = filteredEntries();
+    const isSearching = Boolean(value("search").trim());
     byId("entryCount").textContent = list.length + " " + t("entriesCount");
     if (!list.length) {
       const filtered = !!value("search") || !!value("groupFilter") || !!value("statusFilter");
       byId("entries").innerHTML = '<div class="empty-state"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="3"/><path d="M7 10h6M7 14h4M17 10h.01"/></svg><h3>' + esc(t(filtered ? "noResults" : "noEntries")) + "</h3><p>" + esc(t(filtered ? "noResultsDetail" : "noEntriesDetail")) + "</p></div>";
       return;
     }
-    byId("entries").innerHTML = list.map(entryCardHtml).join("");
+    byId("entries").innerHTML = list.map((entry) => entryCardHtml(entry, isSearching)).join("");
     byId("entries").querySelectorAll("[data-group-color]").forEach((element) => { element.style.backgroundColor = element.dataset.groupColor; });
     updateCodeTimers();
   }
 
-  function entryCardHtml(entry) {
+  function entryCardHtml(entry, isSearching) {
     const enabled = isEnabled(entry);
     const state = codeState[entry.id] || {};
     const code = enabled ? (state.code || "------") : "------";
     const timing = entryTiming(entry);
     const isHotp = entry.otp_type === "hotp";
     const groupBadge = entry.group_name ? '<span class="badge"><i class="swatch" data-group-color="' + safeColor(entry.group_color) + '"></i>' + esc(entry.group_name) + "</span>" : "";
-    const ownerBadge = currentUser && currentUser.role === "admin" && entry.username ? '<span class="badge">' + esc(entry.username) + "</span>" : "";
+    const ownerBadge = !isSearching && currentUser && currentUser.role === "admin" && entry.username ? '<span class="badge">' + esc(entry.username) + "</span>" : "";
     const caption = !enabled ? t("disabled") : (isHotp ? t("clickGenerate") : timing.expiresIn + " " + t("secondsLeft"));
     const groupOptions = ['<option value="">' + esc(t("noGroup")) + "</option>"].concat(groups.filter((group) => Number(group.user_id) === Number(entry.user_id)).map((group) => '<option value="' + group.id + '"' + (Number(group.id) === Number(entry.group_id) ? " selected" : "") + ">" + esc(group.name) + "</option>")).join("");
     return [
